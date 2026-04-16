@@ -1,130 +1,110 @@
 // =====================================================================
-// Module: dac_master_controller (Ultimate Simple Version)
-// Description: 
-//   1. 8 路獨立重置 (DMA x4, FIFO x4)
-//   2. 脈衝觸發翻轉：偵測上升緣 (0->1) 自動切換路徑 0/1。
-//   3. 身份識別：Master 轉發觸發，Slave 接收觸發。
-//   4. 軟體鎖定：sw_force_reset 用於波形裝填前的清潔。
+// Module: dac_master_controller (Final Symmetric Edition)
+// Description:
+//   1. dma_path: 脈衝觸發 (Pulse)，負責 S0/S2 <-> S1/S3 路徑切換。
+//   2. dac_run:  電位維持 (Level)，負責 AXI-Stream 數據流發射。
+//   3. 對稱同步: 支援 Local/Remote 雙輸入與 [1:0] 雙轉發。
 // =====================================================================
 
 module dac_master_controller (
     input  wire        clk,
-    input  wire        periph_resetn,   // 系統全局重置 (Low Active)
+    input  wire        resetn,
 
-    // --- 觸發系統 (僅需脈衝) ---
-    input  wire        is_master_mode,  // 1: Master, 0: Slave
-    input  wire        sw_trigger_in,   // 軟體噴一個脈衝 (0->1->0)
-    input  wire        hw_trigger,      // 實體 PMOD 脈衝
-    output wire [1:0]  trigger_out,     // 轉發給其他 Slave 的訊號
-    
-    // --- 軟體鎖定 (4 bits) ---
-    input  wire [3:0]  sw_force_reset,  // 1 為鎖定, 0 為放開
+    // --- 模式控制 ---
+    input  wire        is_master,           // 1: Master 板, 0: Slave 板
 
-    // --- 8 根獨立硬體重置線 ---
-    output wire dma_aresetn_0, output wire dma_aresetn_1,
-    output wire dma_aresetn_2, output wire dma_aresetn_3,
-    output wire fifo_aresetn_0, output wire fifo_aresetn_1,
-    output wire fifo_aresetn_2, output wire fifo_aresetn_3,
+    // --- 1. DMA Path 控制 (脈衝 Pulse) ---
+    input  wire        dma_path_local_in,   // 本機 GPIO 脈衝
+    input  wire        dma_path_remote_in,  // 來自 PMOD 的遠端脈衝
+    output wire [1:0]  dma_path_forward,    // 轉發 [1:0] 給其他板子
+    output wire        current_path,        // 當前路徑狀態 (0 或 1)
 
-    // --- AXI-Stream S0~S3 (來自 FIFO 0~3) ---
+    // --- 2. DAC Run 控制 (電位 Level) ---
+    input  wire        dac_run_local_in,    // 本機 GPIO 電位 (維持 1 啟動)
+    input  wire        dac_run_remote_in,   // 來自 PMOD 的遠端電位
+    output wire [1:0]  dac_run_forward,     // 轉發 [1:0] 給其他板子
+
+    // --- AXI-Stream Slave Ports (DMA/FIFO) ---
     input  wire [31:0] s0_axis_tdata, input wire s0_axis_tvalid, output wire s0_axis_tready,
     input  wire [31:0] s1_axis_tdata, input wire s1_axis_tvalid, output wire s1_axis_tready,
     input  wire [31:0] s2_axis_tdata, input wire s2_axis_tvalid, output wire s2_axis_tready,
     input  wire [31:0] s3_axis_tdata, input wire s3_axis_tvalid, output wire s3_axis_tready,
 
-    // --- AXI-Stream M_A/M_B ---
+    // --- AXI-Stream Master Ports (Pod A & B) ---
     output wire [31:0] m_axis_a_tdata, output wire m_axis_a_tvalid, input wire m_axis_a_tready,
     output wire [31:0] m_axis_b_tdata, output wire m_axis_b_tvalid, input wire m_axis_b_tready
 );
 
     // -----------------------------------------------------------------
-    // 1. 脈衝觸發與狀態翻轉 (Toggle)
+    // A. 訊號同步器 (防止亞穩態，各打兩拍)
     // -----------------------------------------------------------------
-    wire current_trig = is_master_mode ? sw_trigger_in : hw_trigger;
-    // 這樣改：Master 傳出軟體訊號，Slave 則轉發它收到的硬體訊號
-    assign trigger_out = is_master_mode ? {sw_trigger_in, sw_trigger_in} : 2'b00;
-
-    reg t0, t1, t2;
-    always @(posedge clk) begin
-        t0 <= current_trig;
-        t1 <= t0;
-        t2 <= t1;
-    end
-    wire edge_detect = (t1 == 1'b1 && t2 == 1'b0); // 偵測上升緣
-
-    reg toggle_path;
-    always @(posedge clk) begin
-        if (!periph_resetn) begin
-            toggle_path <= 1'b0; // 系統啟動，強制回到路徑 0 (安全位置)
-        end else if (edge_detect) begin
-            toggle_path <= !toggle_path; // 每次脈衝「咔嗒」一聲就換邊
-        end
-    end
-
-    // Mux 選擇訊號直接等於翻轉狀態
-    wire sel_a = toggle_path;
-    wire sel_b = toggle_path;
-
-    // -----------------------------------------------------------------
-    // 2. 自動清理偵測 (Edge Detection)
-    // -----------------------------------------------------------------
-    reg last_sel;
-    reg [3:0] auto_reset_trig;
+    reg [1:0] sync_path_l, sync_path_r;
+    reg [1:0] sync_run_l,  sync_run_r;
 
     always @(posedge clk) begin
-        if (!periph_resetn) begin
-            last_sel <= 0;
-            auto_reset_trig <= 4'b0000;
+        if (!resetn) begin
+            sync_path_l <= 2'b0; sync_path_r <= 2'b0;
+            sync_run_l  <= 2'b0; sync_run_r  <= 2'b0;
         end else begin
-            last_sel <= toggle_path;
-            // 當 toggle_path 改變，觸發對應的退休路徑重置
-            auto_reset_trig[0] <= (last_sel == 1'b0 && toggle_path == 1'b1); // L0 退休
-            auto_reset_trig[1] <= (last_sel == 1'b1 && toggle_path == 1'b0); // L1 退休
-            auto_reset_trig[2] <= (last_sel == 1'b0 && toggle_path == 1'b1); // L2 退休
-            auto_reset_trig[3] <= (last_sel == 1'b1 && toggle_path == 1'b0); // L3 退休
+            sync_path_l <= {sync_path_l[0], dma_path_local_in};
+            sync_path_r <= {sync_path_r[0], dma_path_remote_in};
+            sync_run_l  <= {sync_run_l[0],  dac_run_local_in};
+            sync_run_r  <= {sync_run_r[0],  dac_run_remote_in};
         end
     end
 
     // -----------------------------------------------------------------
-    // 3. 綜合重置管理與映射 (同前，但更簡潔)
+    // B. 控制來源判定與轉發邏輯
     // -----------------------------------------------------------------
-    reg [3:0] dma_rst_reg, fifo_rst_reg;
-    reg [7:0] rst_cnt [3:0];
-    integer i;
+    // 選取本機實際要跟隨的訊號
+    wire internal_path_sig = is_master ? sync_path_l[1] : sync_path_r[1];
+    wire internal_run_sig  = is_master ? sync_run_l[1]  : sync_run_r[1];
 
-    assign {dma_aresetn_3, dma_aresetn_2, dma_aresetn_1, dma_aresetn_0} = dma_rst_reg;
-    assign {fifo_aresetn_3, fifo_aresetn_2, fifo_aresetn_1, fifo_aresetn_0} = fifo_rst_reg;
+    // 轉發邏輯：只有 Master 才將本機 GPIO 訊號扇出到 [1:0]
+    assign dma_path_forward = is_master ? {sync_path_l[1], sync_path_l[1]} : 2'b00;
+    assign dac_run_forward  = is_master ? {sync_run_l[1],  sync_run_l[1]}  : 2'b00;
+
+    // -----------------------------------------------------------------
+    // C. DMA Path 切換狀態機 (脈衝觸發)
+    // -----------------------------------------------------------------
+    reg  path_p1;
+    reg  path_reg;
+    always @(posedge clk) path_p1 <= internal_path_sig;
+    
+    // 偵測脈衝上升緣
+    wire path_trigger_edge = (internal_path_sig == 1'b1 && path_p1 == 1'b0);
 
     always @(posedge clk) begin
-        if (!periph_resetn) begin
-            dma_rst_reg <= 4'b0000; fifo_rst_reg <= 4'b0000;
-            for (i=0; i<4; i=i+1) rst_cnt[i] <= 0;
-        end else begin
-            for (i=0; i<4; i=i+1) begin
-                if (auto_reset_trig[i]) rst_cnt[i] <= 8'd64;
-                if ((rst_cnt[i] > 0) || (sw_force_reset[i])) begin
-                    dma_rst_reg[i]  <= 1'b0;
-                    fifo_rst_reg[i] <= 1'b0;
-                    if (rst_cnt[i] > 0) rst_cnt[i] <= rst_cnt[i] - 1;
-                end else begin
-                    dma_rst_reg[i]  <= 1'b1;
-                    fifo_rst_reg[i] <= 1'b1;
-                end
-            end
-        end
+        if (!resetn) path_reg <= 1'b0;
+        else if (path_trigger_edge) path_reg <= !path_reg;
     end
 
-    // -----------------------------------------------------------------
-    // 4. AXI-Stream 數據通道 Mux (與之前一致)
-    // -----------------------------------------------------------------
-    assign m_axis_a_tdata  = sel_a ? s1_axis_tdata : s0_axis_tdata;
-    assign m_axis_a_tvalid = sel_a ? s1_axis_tvalid : s0_axis_tvalid;
-    assign s0_axis_tready  = sel_a ? 1'b0 : m_axis_a_tready;
-    assign s1_axis_tready  = sel_a ? m_axis_a_tready : 1'b0;
+    assign current_path = path_reg;
 
-    assign m_axis_b_tdata  = sel_b ? s3_axis_tdata : s2_axis_tdata;
-    assign m_axis_b_tvalid = sel_b ? s3_axis_tvalid : s2_axis_tvalid;
-    assign s2_axis_tready  = sel_b ? 1'b0 : m_axis_b_tready;
-    assign s3_axis_tready  = sel_b ? m_axis_b_tready : 1'b0;
+    // -----------------------------------------------------------------
+    // D. AXI-Stream Mux + Valve (DAC Run 控制)
+    // -----------------------------------------------------------------
+    
+    // Pod A 數據流處理
+    wire [31:0] a_data_mux  = path_reg ? s1_axis_tdata  : s0_axis_tdata;
+    wire        a_valid_mux = path_reg ? s1_axis_tvalid : s0_axis_tvalid;
+    
+    assign m_axis_a_tdata  = a_data_mux;
+    // 當 dac_run 為 1 時才放行 TVALID
+    assign m_axis_a_tvalid = internal_run_sig ? a_valid_mux : 1'b0;
+    
+    // 當 dac_run 為 1 且路徑正確時才回傳 TREADY
+    assign s0_axis_tready  = (!path_reg && internal_run_sig) ? m_axis_a_tready : 1'b0;
+    assign s1_axis_tready  = ( path_reg && internal_run_sig) ? m_axis_a_tready : 1'b0;
+
+    // Pod B 數據流處理
+    wire [31:0] b_data_mux  = path_reg ? s3_axis_tdata  : s2_axis_tdata;
+    wire        b_valid_mux = path_reg ? s3_axis_tvalid : s2_axis_tvalid;
+
+    assign m_axis_b_tdata  = b_data_mux;
+    assign m_axis_b_tvalid = internal_run_sig ? b_valid_mux : 1'b0;
+
+    assign s2_axis_tready  = (!path_reg && internal_run_sig) ? m_axis_b_tready : 1'b0;
+    assign s3_axis_tready  = ( path_reg && internal_run_sig) ? m_axis_b_tready : 1'b0;
 
 endmodule
