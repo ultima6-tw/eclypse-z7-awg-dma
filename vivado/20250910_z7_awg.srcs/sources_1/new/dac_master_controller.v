@@ -41,15 +41,22 @@ module dac_master_controller (
     reg [1:0] sync_path_l, sync_path_r;
     reg [1:0] sync_run_l,  sync_run_r;
 
+    // 新增：path local 延遲 3 cycles
+    reg [4:0] path_local_delay;
+
     always @(posedge clk) begin
         if (!resetn) begin
             sync_path_l <= 2'b0; sync_path_r <= 2'b0;
             sync_run_l  <= 2'b0; sync_run_r  <= 2'b0;
+            path_local_delay <= 11'b0;
         end else begin
             sync_path_l <= {sync_path_l[0], dma_path_local_in};
             sync_path_r <= {sync_path_r[0], dma_path_remote_in};
             sync_run_l  <= {sync_run_l[0],  dac_run_local_in};
             sync_run_r  <= {sync_run_r[0],  dac_run_remote_in};
+            
+            // local 額外延遲 11 cycles
+            path_local_delay <= {path_local_delay[3:0], sync_path_l[1]};
         end
     end
 
@@ -57,11 +64,11 @@ module dac_master_controller (
     // B. 控制來源判定與轉發邏輯
     // -----------------------------------------------------------------
     // 選取本機實際要跟隨的訊號
-    wire internal_path_sig = is_master ? sync_path_l[1] : sync_path_r[1];
+    wire internal_path_sig = is_master ? path_local_delay[4] : sync_path_r[1];
     wire internal_run_sig  = is_master ? sync_run_l[1]  : sync_run_r[1];
 
     // 轉發邏輯：只有 Master 才將本機 GPIO 訊號扇出到 [1:0]
-    assign dma_path_forward = is_master ? {sync_path_l[1], sync_path_l[1]} : 2'b00;
+    assign dma_path_forward = is_master ? {path_local_delay[0], path_local_delay[0]} : 2'b00;
     assign dac_run_forward  = is_master ? {sync_run_l[1],  sync_run_l[1]}  : 2'b00;
 
     // -----------------------------------------------------------------
